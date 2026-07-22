@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Skip Light",
+  "version": "1.6",
+  "description": "Badge lights up when a YouTube ad's Skip button is available. Skip via the popup button or a physical ESP32 button.",
+  "content_scripts": [
+    {
+      "matches": [
+        "*://www.youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "debugger"
+  ],
+  "host_permissions": [
+    "http://skipbutton.local/*",
+    "http://skipbutton2.local/*",
+    "http://skipbutton3.local/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}

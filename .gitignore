@@ -1,0 +1,4 @@
+esp32_skip_button/secrets.h
+build/
+*.zip
+.DS_Store
