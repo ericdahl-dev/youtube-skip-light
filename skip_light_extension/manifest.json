@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube Skip Light",
-  "version": "1.6",
+  "version": "1.7",
   "description": "Badge lights up when a YouTube ad's Skip button is available. Skip via the popup button or a physical ESP32 button.",
   "content_scripts": [
     {

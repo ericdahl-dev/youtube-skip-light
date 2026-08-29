@@ -211,5 +211,21 @@ in `ESP32_URLS` and `manifest.json`, with DHCP reservations.
 The OTA password matters more than it looks — a board on battery across the
 house is flashable by anything on your LAN.
 
-**YouTube renames the Skip button's CSS classes periodically.** If detection
-stops working, check `findSkipButton()` in `content.js` against the live DOM.
+**YouTube renames the Skip button's CSS classes periodically.** `findSkipButton()`
+degrades through three tiers rather than breaking outright:
+
+1. Known exact class names (`.ytp-ad-skip-button` and friends)
+2. Any button in the ad overlay whose class or id contains "skip" — survives
+   renames that keep the word, which every rename so far has
+3. Any button in the ad overlay whose text or `aria-label` says "skip" in one of
+   ~15 languages
+
+When a tier above 1 carries a match, the popup shows an amber
+"detection fallback" warning and the console logs once. That's the cue to update
+`KNOWN_SELECTORS` — it keeps working in the meantime, but on a guess.
+
+**The tiers only ever search inside `.html5-video-player.ad-showing`**, and
+tiers 2–3 additionally require a button-shaped element (40–400 × 16–120 px).
+This matters because the extension issues a *real* OS-level click: a fuzzy match
+on the wrong element would click whatever sits under it. Never widen the fuzzy
+tiers to the whole document — "Skip navigation" alone would break it.
