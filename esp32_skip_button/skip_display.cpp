@@ -13,7 +13,7 @@
 // takes the ST7789 command set, so LovyanGFX's Panel_ST7789 drives it directly.
 //
 // 172x320 visible inside 240x320 of controller RAM, hence offset_x = 34. Get
-// that offset wrong and everything renders shifted with a colour band down one
+// that offset wrong and everything renders shifted with a color band down one
 // edge. Backlight is driven as a plain GPIO — Light_PWM/LEDC did not reliably
 // drive it in a full build.
 class LGFX : public lgfx::LGFX_Device {
@@ -84,7 +84,7 @@ static bool axs_read(axs_touch_t *t) {
   return axs5106l_parse(buf, sizeof(buf), t) == 0;
 }
 
-// Centre a string horizontally at the given text size.
+// Center a string horizontally at the given text size.
 static void center_text(const char *s, int y, int size) {
   s_lcd.setTextSize(size);
   int w = s_lcd.textWidth(s);
@@ -151,7 +151,7 @@ void display_render(bool skipAvailable, const char *status) {
     center_text("tap to skip", h / 2 + 25, 2);
   } else {
     s_lcd.fillScreen(TFT_BLACK);
-    s_lcd.setTextColor(0x39E7, TFT_BLACK);  // dim grey
+    s_lcd.setTextColor(0x39E7, TFT_BLACK);  // dim gray
     center_text("no ad", h / 2 - 28, 4);
   }
 
