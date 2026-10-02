@@ -49,7 +49,7 @@ LovyanGFX's `Panel_ST7789` drives it.
 | Touch (AXS5106L) SDA / SCL / RST | 42 / 41 / 47, I²C `0x63` |
 
 172×320 visible inside 240×320 of controller RAM, hence `offset_x = 34`. Get
-that wrong and everything renders shifted with a colour band down one edge.
+that wrong and everything renders shifted with a color band down one edge.
 Backlight is a plain GPIO — LovyanGFX's `Light_PWM`/LEDC did not reliably drive
 it. Requires the **LovyanGFX** library.
 
@@ -134,7 +134,7 @@ vX.Y loaded`) tells you which version a tab is running.
 `ESP32_URLS` in `background.js` lists every board. All are lit together and a
 press from any one skips. To add a board: add its URL there **and** a matching
 entry in `host_permissions` in `manifest.json` (`skipbutton3.local` is already
-authorised). Unreachable entries are harmless — they count as offline.
+authorized). Unreachable entries are harmless — they count as offline.
 
 ---
 
