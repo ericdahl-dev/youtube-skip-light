@@ -1,12 +1,20 @@
 // ESP32 YouTube Skip Button Indicator
 //
-// - Onboard RGB LED lights green when a skippable ad's Skip button is available
-// - Physical button press tells the browser extension to click Skip
+// - Onboard RGB LED / screen shows what the button will do right now
+// - A press is queued for the browser extension, which decides what it means
+//
+// The board is deliberately ignorant of YouTube. It holds a MODE, set by the
+// extension, and that mode drives exactly two things: what color to show, and
+// whether a press is worth queueing at all. It never learns what "skip" or
+// "back" do — the extension is the only side that can see the page, so it
+// interprets the press when it collects it. Adding a mode later is a one-line
+// change here and all the real work over there.
 //
 // Endpoints:
-//   GET /skip?state=1|0  -> extension reports skip availability
-//   GET /poll            -> extension polls; returns "1" once after a button press
-//   GET /                -> human-readable status page
+//   GET /mode?m=skip|back|idle -> extension reports what the button should do
+//   GET /skip?state=1|0        -> legacy alias: 1 = skip mode, 0 = idle
+//   GET /poll                  -> extension polls; "1" once after a press
+//   GET /                      -> human-readable status page
 //
 // Builds for either board; pins come from the core's variant header where
 // available, so add a board by adding an #elif rather than editing the logic.
@@ -20,10 +28,13 @@
 //     Optional external button on GPIO 4 to GND.
 //
 // LED colors:
-//   off    = idle, no skippable ad
-//   green  = Skip is available, press the button
-//   blue   = connecting to WiFi
-//   red    = WiFi lost
+//   off        = idle, nothing to act on
+//   green      = Skip is available, press the button
+//   blue       = back mode: a press goes back a video, OR (before any mode is
+//                set) still connecting to WiFi. They cannot overlap: no mode
+//                arrives until the network is up.
+//   red        = WiFi lost
+//   purple     = OTA update in progress
 //
 // Runs the low-power profile unconditionally (WiFi modem sleep on, LED dim).
 // It roughly halves idle current for battery use, and costs up to ~100 ms of
@@ -83,8 +94,33 @@ const uint8_t LED_BRIGHTNESS = 20;
 
 WebServer server(80);
 
-bool skipAvailable = false;
+// What the button will do if it is pressed right now.
+//
+// The firmware deliberately knows nothing about what these MEAN. It needs a
+// mode only to pick a color and to decide whether a press is worth queueing.
+// The extension is the only thing that can see the page, so it decides what an
+// arriving press actually does — which is why adding a mode later costs no
+// firmware change at all.
+enum ButtonMode {
+  MODE_IDLE = 0,  // nothing to act on; presses are dropped
+  MODE_SKIP = 1,  // ad on screen with a live Skip button
+  MODE_BACK = 2,  // a watch page, no ad: the press navigates back
+};
+
+// Held as an int, not a ButtonMode. The .ino preprocessor hoists generated
+// prototypes above this file's own declarations, so an enum-typed parameter
+// gets declared before the enum exists and fails to compile. The constants
+// above still give every assignment and comparison a name.
+int buttonMode = MODE_IDLE;
 bool pressPending = false;
+
+const char *modeName(int m) {
+  switch (m) {
+    case MODE_SKIP: return "skip";
+    case MODE_BACK: return "back";
+    default:        return "idle";
+  }
+}
 
 // Debounce, tracked per button so either can trigger a press
 struct Button {
@@ -112,7 +148,7 @@ void setLed(uint8_t r, uint8_t g, uint8_t b) {
 #endif
 }
 
-void showSkipState() {
+void showMode() {
 #ifdef HAS_TOUCH_DISPLAY
   char status[40];
   if (WiFi.status() == WL_CONNECTED) {
@@ -120,30 +156,66 @@ void showSkipState() {
   } else {
     snprintf(status, sizeof(status), "wifi down");
   }
-  display_render(skipAvailable, status);
+  display_render((int)buttonMode, status);
 #else
-  if (skipAvailable) {
-    setLed(0, LED_BRIGHTNESS, 0);  // green
-  } else {
-    setLed(0, 0, 0);  // off
+  switch (buttonMode) {
+    case MODE_SKIP:
+      setLed(0, LED_BRIGHTNESS, 0);  // green — the urgent one
+      break;
+    case MODE_BACK:
+      // Blue, matching the blue field the touch board shows, so the two kinds
+      // of board describe the same state the same way.
+      //
+      // NOTE: connectWifi() also shows blue on these screenless boards. The two
+      // never overlap in practice — no mode is set until WiFi is up — but if a
+      // steady blue is ever ambiguous to you, change the connecting color, not
+      // this one.
+      setLed(0, 0, LED_BRIGHTNESS);
+      break;
+    default:
+      setLed(0, 0, 0);
+      break;
   }
 #endif
 }
 
+void setMode(int next) {
+  if (next == buttonMode) return;
+  buttonMode = next;
+  showMode();
+  Serial.printf("mode: %s\n", modeName(buttonMode));
+
+  // Leaving idle-or-skip for anything else invalidates a queued press: it was
+  // aimed at whatever was on screen a moment ago, and acting on it now would
+  // fire at the wrong target.
+  if (buttonMode == MODE_IDLE) pressPending = false;
+}
+
+// Legacy endpoint. An older extension only knows about skip-or-nothing, so
+// keep answering it: state=1 means skip, state=0 means idle. Newer builds call
+// /mode instead. Cheap to keep, and it means a half-updated pair still works.
 void handleSkip() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   if (server.hasArg("state")) {
-    bool next = server.arg("state") == "1";
-    if (next != skipAvailable) {
-      skipAvailable = next;
-      showSkipState();
-      Serial.printf("skip available: %s\n", skipAvailable ? "yes" : "no");
-    }
-    if (!skipAvailable) {
-      pressPending = false;  // ad ended / skip consumed; clear any stale press
-    }
+    setMode(server.arg("state") == "1" ? MODE_SKIP : MODE_IDLE);
   }
   server.send(200, "text/plain", "ok");
+}
+
+// GET /mode?m=skip|back|idle
+void handleMode() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (server.hasArg("m")) {
+    String m = server.arg("m");
+    if (m == "skip") {
+      setMode(MODE_SKIP);
+    } else if (m == "back") {
+      setMode(MODE_BACK);
+    } else {
+      setMode(MODE_IDLE);
+    }
+  }
+  server.send(200, "text/plain", modeName(buttonMode));
 }
 
 void handlePoll() {
@@ -162,8 +234,51 @@ void handleRoot() {
   body += "host: " + String(deviceHost) + ".local\n";
   body += "ip: " + WiFi.localIP().toString() + "\n";
   body += "rssi: " + String(WiFi.RSSI()) + " dBm\n";
-  body += "skipAvailable: " + String(skipAvailable ? "1" : "0") + "\n";
+  // Which access point, not just how strong. On a multi-AP network the useful
+  // question is never "is the signal weak" but "weak to WHICH radio" — the
+  // board may be holding onto a distant AP while a closer one sits unused.
+  body += "ssid: " + WiFi.SSID() + "\n";
+  body += "bssid: " + WiFi.BSSIDstr() + "\n";
+  body += "channel: " + String(WiFi.channel()) + "\n";
+  body += "mode: " + String(modeName(buttonMode)) + "\n";
   body += "uptime: " + String(millis() / 1000) + "s\n";
+#ifdef HAS_TOUCH_DISPLAY
+  body += "touchPresses: " + String(display_touch_presses()) + "\n";
+  body += "touchZeros: " + String(display_touch_zeros()) + "\n";
+#endif
+  server.send(200, "text/plain", body);
+}
+
+// GET /scan — every AP visible FROM THE BOARD, strongest first.
+//
+// This is the measurement that actually settles a multi-AP question. RSSI on
+// the status page says how well the current link is doing; this says whether a
+// better one was available all along. A closer AP listed here with a much
+// stronger RSSI than the associated one means the board simply never roamed.
+//
+// Blocks for a couple of seconds and briefly disturbs the link, so it is a
+// deliberate diagnostic, never something the extension should poll.
+void handleScan() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+
+  int n = WiFi.scanNetworks(false /* async */, true /* show hidden */);
+  String body = "visible APs from the board (strongest first)\n";
+  body += "associated: " + WiFi.BSSIDstr() + " ch" + String(WiFi.channel()) +
+          " " + String(WiFi.RSSI()) + " dBm\n\n";
+
+  if (n <= 0) {
+    body += "(none found)\n";
+  } else {
+    for (int i = 0; i < n; i++) {
+      // scanNetworks already returns results sorted by descending RSSI.
+      body += String(WiFi.RSSI(i)) + " dBm  ch" + String(WiFi.channel(i)) +
+              "  " + WiFi.BSSIDstr(i) + "  " + WiFi.SSID(i);
+      if (WiFi.BSSIDstr(i) == WiFi.BSSIDstr()) body += "   <== associated";
+      body += "\n";
+    }
+  }
+
+  WiFi.scanDelete();  // the results list is heap-allocated; don't leak it
   server.send(200, "text/plain", body);
 }
 
@@ -205,7 +320,30 @@ void connectWifi() {
   display_message("WiFi", WIFI_SSID, 0x001F);  // blue
 #endif
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(true);  // modem sleep; see header note
+  // Modem sleep halves idle current but lets the WiFi stack stall the main loop
+  // for tens of ms at a time — worse on a weak signal. On the touch board that
+  // starves the I2C touch poll and drops taps, so keep the radio awake there;
+  // its backlight dwarfs any sleep savings anyway. Battery boards keep sleep on.
+#ifdef HAS_TOUCH_DISPLAY
+  WiFi.setSleep(false);
+#else
+  WiFi.setSleep(true);
+#endif
+  // Pick the STRONGEST access point, not the first one heard.
+  //
+  // The ESP32 default is WIFI_FAST_SCAN, which stops at the first AP matching
+  // the SSID and connects to it — fine with one router, actively harmful with
+  // several, because "first heard" has nothing to do with "nearest". Measured
+  // on this network before the fix: associated at -88 dBm while an AP with the
+  // same SSID sat on the SAME CHANNEL at -51 dBm, ignored. That is ~37 dB, and
+  // -88 is squarely in the range where the WiFi stack stalls the main loop and
+  // taps on the glass get dropped.
+  //
+  // ALL_CHANNEL_SCAN costs roughly a second of extra connect time, once, at
+  // boot. Worth it.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -215,7 +353,7 @@ void connectWifi() {
   Serial.println();
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
-  showSkipState();
+  showMode();
 }
 
 void setup() {
@@ -250,6 +388,8 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/skip", handleSkip);
+  server.on("/mode", handleMode);
+  server.on("/scan", handleScan);
   server.on("/poll", handlePoll);
   server.begin();
   Serial.println("HTTP server started");
@@ -271,10 +411,10 @@ void loop() {
 
 #ifdef HAS_TOUCH_DISPLAY
   // Tapping the glass is the same gesture as pressing the button. Guarded by
-  // skipAvailable so a stray tap with no ad on screen can't queue a stale press.
-  if (display_touched() && skipAvailable) {
+  // the mode so a stray tap with nothing on screen can't queue a stale press.
+  if (display_touched() && buttonMode != MODE_IDLE) {
     pressPending = true;
-    Serial.println("Touch -> queueing skip");
+    Serial.printf("Touch -> queueing %s\n", modeName(buttonMode));
   }
 #endif
 
@@ -288,9 +428,10 @@ void loop() {
     if (millis() - btn.lastDebounce > DEBOUNCE_MS) {
       if (reading != btn.stableState) {
         btn.stableState = reading;
-        if (btn.stableState == LOW && skipAvailable) {
+        if (btn.stableState == LOW && buttonMode != MODE_IDLE) {
           pressPending = true;
-          Serial.printf("Button (GPIO %d) pressed -> queueing skip\n", btn.pin);
+          Serial.printf("Button (GPIO %d) pressed -> queueing %s\n",
+                        btn.pin, modeName(buttonMode));
         }
       }
     }

@@ -13,7 +13,7 @@
 // takes the ST7789 command set, so LovyanGFX's Panel_ST7789 drives it directly.
 //
 // 172x320 visible inside 240x320 of controller RAM, hence offset_x = 34. Get
-// that offset wrong and everything renders shifted with a colour band down one
+// that offset wrong and everything renders shifted with a color band down one
 // edge. Backlight is driven as a plain GPIO — Light_PWM/LEDC did not reliably
 // drive it in a full build.
 class LGFX : public lgfx::LGFX_Device {
@@ -63,10 +63,21 @@ public:
 static LGFX s_lcd;
 
 // Repaint only on change: a full fillScreen on every 300 ms tick would flicker.
-static int s_lastSkip = -1;
+static int s_lastMode = -1;
 static char s_lastStatus[40] = {0};
 
 static bool s_fingerDown = false;
+
+// Bench-observable counters, surfaced on the HTTP status page so touch health
+// can be checked without a serial cable.
+static uint32_t s_touch_presses = 0;  // taps actually registered
+static uint32_t s_touch_zeros = 0;    // phantom zeros caught mid-contact and ignored
+
+// The AXS5106L intermittently returns a fully SUCCESSFUL read reporting zero
+// touch points while a finger is on the glass. A read that lost the finger to
+// one of these must be re-checked, not believed. Three back-to-back reads on a
+// 400 kHz bus cost well under a millisecond.
+#define TOUCH_CONFIRM 3
 
 static void backlight_on(void) {
   pinMode(LCD_BL, OUTPUT);
@@ -118,7 +129,7 @@ void display_begin(void) {
 }
 
 void display_message(const char *line1, const char *line2, unsigned long color) {
-  s_lastSkip = -1;  // force a repaint next time state is rendered
+  s_lastMode = -1;  // force a repaint next time state is rendered
   const int h = s_lcd.height();
   s_lcd.fillScreen(TFT_BLACK);
   s_lcd.setTextColor((uint16_t)color, TFT_BLACK);
@@ -129,34 +140,45 @@ void display_message(const char *line1, const char *line2, unsigned long color) 
   }
 }
 
-void display_render(bool skipAvailable, const char *status) {
-  const int want = skipAvailable ? 1 : 0;
-  if (want == s_lastSkip && status && strncmp(status, s_lastStatus, sizeof(s_lastStatus) - 1) == 0) {
+void display_render(int mode, const char *status) {
+  if (mode == s_lastMode && status && strncmp(status, s_lastStatus, sizeof(s_lastStatus) - 1) == 0) {
     return;  // nothing changed
   }
-  s_lastSkip = want;
+  s_lastMode = mode;
   if (status) {
     strncpy(s_lastStatus, status, sizeof(s_lastStatus) - 1);
     s_lastStatus[sizeof(s_lastStatus) - 1] = '\0';
   }
 
   const int h = s_lcd.height();
+  unsigned long bg = TFT_BLACK;
 
-  if (skipAvailable) {
+  if (mode == 1) {
     // Green field, black text — readable across a room and unmistakable.
     // Size 8 = 48x64 px glyphs, so "SKIP" is 192 px of the 320 px width.
-    s_lcd.fillScreen(TFT_GREEN);
-    s_lcd.setTextColor(TFT_BLACK, TFT_GREEN);
+    bg = TFT_GREEN;
+    s_lcd.fillScreen(bg);
+    s_lcd.setTextColor(TFT_BLACK, bg);
     center_text("SKIP", h / 2 - 55, 8);
     center_text("tap to skip", h / 2 + 25, 2);
+  } else if (mode == 2) {
+    // Blue field, white text — the same treatment SKIP gets, so the two armed
+    // states read as siblings and the color alone tells you which one you are
+    // in. 0x041F is a bright azure rather than TFT_BLUE (0x001F), which is dark
+    // enough that text on it is a squint.
+    bg = 0x041F;
+    s_lcd.fillScreen(bg);
+    s_lcd.setTextColor(TFT_WHITE, bg);
+    center_text("BACK", h / 2 - 55, 8);
+    center_text("tap for prev video", h / 2 + 25, 2);
   } else {
-    s_lcd.fillScreen(TFT_BLACK);
-    s_lcd.setTextColor(0x39E7, TFT_BLACK);  // dim grey
+    s_lcd.fillScreen(bg);
+    s_lcd.setTextColor(0x39E7, bg);  // dim grey
     center_text("no ad", h / 2 - 28, 4);
   }
 
   if (status && *status) {
-    s_lcd.setTextColor(0x7BEF, skipAvailable ? TFT_GREEN : TFT_BLACK);
+    s_lcd.setTextColor(0x7BEF, bg);
     s_lcd.setTextSize(1);
     int w = s_lcd.textWidth(status);
     s_lcd.setCursor((s_lcd.width() - w) / 2, s_lcd.height() - 14);
@@ -164,13 +186,30 @@ void display_render(bool skipAvailable, const char *status) {
   }
 }
 
+uint32_t display_touch_presses(void) { return s_touch_presses; }
+uint32_t display_touch_zeros(void) { return s_touch_zeros; }
+
 bool display_touched(void) {
   axs_touch_t t;
-  if (!axs_read(&t)) return false;
+  bool touched = axs_read(&t) && t.points_len > 0;
 
-  const bool down = t.points_len > 0;
-  const bool edge = down && !s_fingerDown;  // rising edge only: one tap, one press
-  s_fingerDown = down;
+  // Phantom-zero mitigation. Touches are trustworthy; zeros are not. So if this
+  // read shows no finger, re-read a few times before concluding the glass is
+  // clear — otherwise a quick tap whose sample happened to land on a phantom
+  // zero is silently dropped, and you have to tap again. An I2C failure (read
+  // returns false) is left alone: don't invent a touch, and don't update the
+  // held state on a failed read.
+  for (int i = 0; i < TOUCH_CONFIRM && !touched; i++) {
+    axs_touch_t r;
+    if (axs_read(&r) && r.points_len > 0) {
+      touched = true;
+      s_touch_zeros++;  // first read lied; a finger was there all along
+    }
+  }
+
+  const bool edge = touched && !s_fingerDown;  // rising edge only: one tap, one press
+  s_fingerDown = touched;
+  if (edge) s_touch_presses++;
   return edge;
 }
 

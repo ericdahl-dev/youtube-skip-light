@@ -5,23 +5,96 @@
 // HTTPS page as mixed content. A service worker is not an HTTPS document, so
 // it can talk to http://skipbutton.local freely (host_permissions covers CORS).
 
-// Every board is lit, and a press from ANY of them skips. Each board must have
-// its own mDNS name — two boards answering to "skipbutton" makes
-// skipbutton.local resolve to whichever replies first, and it flips between
-// reboots. Firmware sets this with -DDEVICE_INDEX=N.
+// Every board is lit, and a press from ANY of them skips.
 //
-// Add entries here AND to host_permissions in manifest.json. Unreachable
-// entries are harmless: they just count as offline.
+// IPs, not .local names. mDNS resolution from macOS proved unreliable in
+// practice: measured 0/6 lookups of skipbutton.local completing (getaddrinfo
+// hung past 5 s) while that same board answered its IP in 12-35 ms, 6/6.
+//
+// UNREACHABLE ENTRIES ARE NOT FREE. Both fan-outs below are Promise.all, so
+// they wait for the slowest URL — a name that won't resolve costs the full
+// ESP32_TIMEOUT_MS on every single poll. Two dead entries plus a 300 ms tick
+// stacked polls ~7 deep, and 7 concurrent connections measurably stall the
+// board's single-threaded WebServer for ~1 s. During that stall loop() sits in
+// server.handleClient() and never samples the touch panel, so taps on the glass
+// are silently dropped and you have to tap again.
+//
+// So: list only boards that actually exist, and give each a DHCP reservation
+// so its address stays put. Add entries here AND to host_permissions in
+// manifest.json. Each board still needs its own -DDEVICE_INDEX=N for mDNS/OTA.
 const ESP32_URLS = [
-  "http://skipbutton.local",   // Waveshare Touch LCD 1.47
-  "http://skipbutton2.local",  // QT Py ESP32-S3
-  "http://skipbutton3.local",  // ESP32-S3 Super Mini
+  "http://192.168.0.81", // Waveshare Touch LCD 1.47
 ];
 
-const ESP32_TIMEOUT_MS = 2000;
+// The board answers in tens of milliseconds on a LAN; a second is ~30x headroom.
+// Kept short deliberately, so a board that drops off stalls one tick, not seven.
+const ESP32_TIMEOUT_MS = 1000;
 
 let onlineCount = 0;
-let lastAvailable = false;
+let lastMode = "idle";
+
+// tabId -> "skip" | "back", for every YouTube tab currently armed. Idle tabs are
+// deleted rather than stored, so the map doubles as the set of live candidates.
+//
+// This map is the whole reason press routing lives here. /poll is read-once on
+// the board, so exactly one tab may act on a press — but every armed tab polls,
+// and the one that happens to collect it is not necessarily the one you were
+// looking at. Only the worker can see all the tabs, so only the worker can
+// choose correctly.
+const tabModes = new Map();
+
+// A tab that navigates away or closes must not stay a candidate; otherwise a
+// press could be routed into a dead tab and silently lost.
+chrome.tabs.onRemoved.addListener((tabId) => tabModes.delete(tabId));
+
+// Aggregate of every tab, which is what the board shows. Skip wins over back:
+// an ad is time-limited and the reason you reach for the button, whereas back
+// is available for as long as the video is.
+function aggregateMode() {
+  let sawBack = false;
+  for (const m of tabModes.values()) {
+    if (m === "skip") return "skip";
+    if (m === "back") sawBack = true;
+  }
+  return sawBack ? "back" : "idle";
+}
+
+// Which tab a press belongs to.
+//
+// A skip is unambiguous — an ad is on screen and it is the only thing you could
+// mean, so it wins wherever it is. Back is ambiguous whenever two videos are
+// open, and the only sane reading of "go back" is the tab you are actually
+// looking at. If the focused tab is not armed, a press is dropped rather than
+// guessed at: navigating a background tab you cannot see is worse than nothing.
+async function pickPressTarget() {
+  for (const [tabId, m] of tabModes) {
+    if (m === "skip") return { tabId, mode: "skip" };
+  }
+
+  try {
+    const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (active && tabModes.get(active.id) === "back") {
+      return { tabId: active.id, mode: "back" };
+    }
+  } catch {
+    /* no focused window (all minimized, or Chrome in the background) */
+  }
+  return null;
+}
+
+async function routePress() {
+  const target = await pickPressTarget();
+  if (!target) {
+    console.log("[skip-light] press with no eligible tab — dropped");
+    return;
+  }
+  try {
+    await chrome.tabs.sendMessage(target.tabId, { type: "doPress", mode: target.mode });
+  } catch (err) {
+    // Orphaned content script, or the tab went away between the poll and now.
+    console.warn("[skip-light] press routing failed —", err?.message);
+  }
+}
 
 async function esp32(base, path) {
   const res = await fetch(`${base}${path}`, {
@@ -32,11 +105,11 @@ async function esp32(base, path) {
 
 // Fan out to every board in parallel. One slow or absent board must not delay
 // the others, so these are independent rather than sequential.
-async function setEsp32Led(available) {
+async function setEsp32Mode(mode) {
   const results = await Promise.all(
     ESP32_URLS.map(async (base) => {
       try {
-        await esp32(base, `/skip?state=${available ? 1 : 0}`);
+        await esp32(base, `/mode?m=${encodeURIComponent(mode)}`);
         return true;
       } catch {
         return false;
@@ -62,20 +135,26 @@ async function pollEsp32() {
   onlineCount = results.filter((r) => r.online).length;
 
   // A board that just appeared (or rebooted) has a stale light; resync it.
-  if (wasAllOffline && onlineCount > 0) setEsp32Led(lastAvailable);
+  if (wasAllOffline && onlineCount > 0) setEsp32Mode(lastMode);
+
+  const pressed = results.some((r) => r.pressed);
+  if (pressed) routePress();
 
   return {
     online: onlineCount > 0,
-    pressed: results.some((r) => r.pressed),
+    pressed,
     count: onlineCount,
   };
 }
 
-function setBadge(tabId, available) {
+function setBadge(tabId, mode) {
   if (tabId == null) return;
-  if (available) {
+  if (mode === "skip") {
     chrome.action.setBadgeBackgroundColor({ tabId, color: "#22c55e" });
     chrome.action.setBadgeText({ tabId, text: "SKIP" });
+  } else if (mode === "back") {
+    chrome.action.setBadgeBackgroundColor({ tabId, color: "#64748b" });
+    chrome.action.setBadgeText({ tabId, text: "BACK" });
   } else {
     chrome.action.setBadgeText({ tabId, text: "" });
   }
@@ -126,16 +205,35 @@ async function trustedClick(tabId, x, y) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Report the outcome back. The ESP32 clears pressPending the moment it hands
+  // the press over, so a click that fails here is the end of the road for that
+  // press unless the caller learns it failed and tries again.
   if (msg.type === "trustedClick") {
     const tabId = sender.tab?.id;
-    if (tabId != null) trustedClick(tabId, msg.x, msg.y);
-    return false;
+    if (tabId == null) {
+      sendResponse({ ok: false });
+      return false;
+    }
+    trustedClick(tabId, msg.x, msg.y).then((ok) => sendResponse({ ok }));
+    return true; // response is async
   }
 
-  if (msg.type === "skipState") {
-    setBadge(sender.tab?.id, msg.available);
-    lastAvailable = msg.available;
-    setEsp32Led(msg.available);
+  if (msg.type === "modeState") {
+    const tabId = sender.tab?.id;
+    if (tabId != null) {
+      if (msg.mode === "idle") {
+        tabModes.delete(tabId);
+      } else {
+        tabModes.set(tabId, msg.mode);
+      }
+    }
+    setBadge(tabId, msg.mode);
+
+    const agg = aggregateMode();
+    if (agg !== lastMode) {
+      lastMode = agg;
+      setEsp32Mode(agg);
+    }
     return false;
   }
 

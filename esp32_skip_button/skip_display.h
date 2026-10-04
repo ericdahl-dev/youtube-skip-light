@@ -12,13 +12,17 @@
 // set), AXS5106L touch over I2C at 0x63.
 
 #include <stdbool.h>
+#include <stdint.h>
 
 // Panel + touch init, and paints the boot screen. Call early in setup().
 void display_begin(void);
 
 // Repaint for the current state. Cheap to call repeatedly — it only redraws
 // when something actually changed.
-void display_render(bool skipAvailable, const char *status);
+//
+// mode matches ButtonMode in the sketch: 0 idle, 1 skip, 2 back. Passed as an
+// int rather than the enum so this header stays free of the sketch's types.
+void display_render(int mode, const char *status);
 
 // Full-screen message, for states with no skip involved (connecting, OTA).
 void display_message(const char *line1, const char *line2, unsigned long color);
@@ -26,5 +30,10 @@ void display_message(const char *line1, const char *line2, unsigned long color);
 // True once per new finger-down. Returns false while a finger stays down, so
 // one tap is one press.
 bool display_touched(void);
+
+// Bench counters for touch health, exposed on the HTTP status page.
+// presses = taps registered; zeros = phantom no-touch reads caught and ignored.
+uint32_t display_touch_presses(void);
+uint32_t display_touch_zeros(void);
 
 #endif  // SKIP_DISPLAY_H
