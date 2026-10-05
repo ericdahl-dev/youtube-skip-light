@@ -147,6 +147,25 @@ async function pollEsp32() {
   };
 }
 
+// Record one tab's mode, then push the aggregate to the board if it changed.
+// Idempotent, so it is safe to call on every poll as well as on mode changes.
+function applyTabMode(tabId, mode) {
+  if (tabId != null) {
+    if (mode === "idle") {
+      tabModes.delete(tabId);
+    } else {
+      tabModes.set(tabId, mode);
+    }
+  }
+  setBadge(tabId, mode);
+
+  const agg = aggregateMode();
+  if (agg !== lastMode) {
+    lastMode = agg;
+    setEsp32Mode(agg);
+  }
+}
+
 function setBadge(tabId, mode) {
   if (tabId == null) return;
   if (mode === "skip") {
@@ -219,25 +238,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === "modeState") {
-    const tabId = sender.tab?.id;
-    if (tabId != null) {
-      if (msg.mode === "idle") {
-        tabModes.delete(tabId);
-      } else {
-        tabModes.set(tabId, msg.mode);
-      }
-    }
-    setBadge(tabId, msg.mode);
-
-    const agg = aggregateMode();
-    if (agg !== lastMode) {
-      lastMode = agg;
-      setEsp32Mode(agg);
-    }
+    applyTabMode(sender.tab?.id, msg.mode);
     return false;
   }
 
   if (msg.type === "esp32Poll") {
+    // Every poll carries the tab's current mode. A tab only sends modeState
+    // when its mode CHANGES, so if Chrome restarts this worker (idle shutdown,
+    // extension reload) tabModes comes back empty while the tab — and the
+    // board's light — still say back. Presses would then be dropped as "no
+    // eligible tab" with the board showing BACK. Re-applying the mode here
+    // rebuilds the map within one tick of the restart.
+    if (msg.mode) applyTabMode(sender.tab?.id, msg.mode);
     pollEsp32().then(sendResponse);
     return true; // response is async
   }

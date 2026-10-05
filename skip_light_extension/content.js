@@ -9,6 +9,7 @@
 //
 //   skip  ad on screen with a live Skip button  -> trusted click on Skip
 //   back  a watch page with no ad               -> history.back()
+//         a Short (ad or not)                   -> youtube.com home
 //   idle  anything else                         -> press dropped
 //
 // The board holds the mode only to pick a color; this side decides what a
@@ -19,7 +20,7 @@
 // content ("requested an insecure resource 'http://skipbutton.local/poll'").
 // All ESP32 traffic goes through background.js, which is exempt.
 
-console.log("[skip-light] content script v2.1 loaded — no page-context HTTP");
+console.log("[skip-light] content script v2.2 loaded — no page-context HTTP");
 
 const TICK_MS = 300;
 const ESP32_RETRY_MS = 15000; // how often to re-check the ESP32s while idle
@@ -287,6 +288,13 @@ function currentMode() {
   // navigates away from the video instead of skipping the ad.
   if (skipAvailable) return "skip";
 
+  // Shorts: back means "out of Shorts, to the home page", not the previous
+  // Short. The button is an exit for a kid who scrolled in, so it must not
+  // become a faster way to keep swiping. Checked before the ad guard on
+  // purpose: a sponsored Short is still a Short, and the exit should work
+  // there too.
+  if (onShorts()) return "back";
+
   const player = document.querySelector(".html5-video-player");
 
   // An ad is up but has no Skip button yet: the countdown, or an unskippable
@@ -307,10 +315,21 @@ function currentMode() {
   return "back";
 }
 
+function onShorts() {
+  return location.pathname.startsWith("/shorts/") && !!document.querySelector("video");
+}
+
 // Navigating back is the whole point of back mode, and history.back() drives
 // YouTube's own SPA router, so it lands on the previous video rather than doing
 // a full page load.
+//
+// Shorts go home instead. history.back() there would usually land on the
+// previous Short, which is the opposite of what the button is for.
 function goBack() {
+  if (onShorts()) {
+    location.assign("https://www.youtube.com/");
+    return true;
+  }
   if (history.length <= 1) return false;
   history.back();
   return true;
@@ -325,7 +344,9 @@ function pollEsp32() {
   // /poll is read-once, so whichever tab happened to ask first would consume a
   // press meant for another one. The service worker sees all tabs, so it picks
   // the right one and sends it a doPress. This tab just reports connectivity.
-  send({ type: "esp32Poll" })
+  // The mode rides along so a restarted service worker relearns it (see the
+  // esp32Poll handler in background.js).
+  send({ type: "esp32Poll", mode })
     .then((res) => {
       if (!res) return;
       esp32Online = res.online;
